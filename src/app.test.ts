@@ -74,13 +74,55 @@ const fakeDb = {
       masteryPercent: 0,
       streakDays: 0,
       level: "Fledgling",
-      recentLesson: null
+      recentLesson: null,
+      recentLessons: []
+    };
+  },
+  async getStateSnapshot() {
+    return {
+      dashboard: {
+        xp: 0,
+        documentCount: 0,
+        masteryPercent: 0,
+        streakDays: 0,
+        level: "Fledgling",
+        recentLesson: null,
+        recentLessons: []
+      },
+      progress: {
+        xp: 0,
+        level: "Fledgling",
+        masteryPercent: 0,
+        streakDays: 0,
+        badges: ["Fledgling"],
+        topics: [{ name: "Java Foundations", mastery: 0 }],
+        xpToNextLevel: 100
+      }
+    };
+  },
+  async getLessons() {
+    return {
+      items: [],
+      total: 0
+    };
+  },
+  async getProgressStats() {
+    return {
+      xp: 0,
+      level: "Fledgling",
+      masteryPercent: 0,
+      streakDays: 0,
+      badges: ["Fledgling"],
+      topics: [{ name: "Java Foundations", mastery: 0 }],
+      xpToNextLevel: 100
     };
   },
   async getChallengeById() {
     return null;
   },
-  async saveAttempt() {}
+  async saveAttempt() {
+    return { gainedXp: 10, totalXp: 10, level: "Fledgling", streakDays: 1 };
+  }
 } as unknown as DatabaseService;
 
 const app = createApp(testProvider, fakeDb);

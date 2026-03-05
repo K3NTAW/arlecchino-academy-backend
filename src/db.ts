@@ -18,6 +18,68 @@ type StoredChallenge = {
   difficulty: string;
 };
 
+type DashboardStats = {
+  xp: number;
+  documentCount: number;
+  masteryPercent: number;
+  streakDays: number;
+  level: string;
+  recentLesson: { id: number; title: string } | null;
+  recentLessons: Array<{ id: number; title: string; createdAt: string }>;
+};
+
+type ProgressStats = {
+  xp: number;
+  level: string;
+  masteryPercent: number;
+  streakDays: number;
+  badges: string[];
+  topics: Array<{ name: string; mastery: number }>;
+  xpToNextLevel: number;
+};
+
+function levelFromXp(xp: number): string {
+  if (xp >= 1500) {
+    return "Harbinger";
+  }
+  if (xp >= 800) {
+    return "Agent of the House";
+  }
+  if (xp >= 300) {
+    return "Shadow";
+  }
+  if (xp >= 100) {
+    return "Apprentice";
+  }
+  return "Fledgling";
+}
+
+function xpToNextLevel(xp: number): number {
+  const thresholds = [100, 300, 800, 1500];
+  const next = thresholds.find((value) => xp < value);
+  return next ? next - xp : 0;
+}
+
+function badgeKeysFromXp(xp: number): string[] {
+  if (xp >= 1500) {
+    return ["Fledgling", "Apprentice", "Shadow", "Agent of the House", "Harbinger"];
+  }
+  if (xp >= 800) {
+    return ["Fledgling", "Apprentice", "Shadow", "Agent of the House"];
+  }
+  if (xp >= 300) {
+    return ["Fledgling", "Apprentice", "Shadow"];
+  }
+  if (xp >= 100) {
+    return ["Fledgling", "Apprentice"];
+  }
+  return ["Fledgling"];
+}
+
+function dateOnlyUtc(value: Date): string {
+  return value.toISOString().slice(0, 10);
+}
+
 export class DatabaseService {
   private readonly pool: Pool;
 
@@ -68,6 +130,42 @@ export class DatabaseService {
         is_correct BOOLEAN NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+    `);
+
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS profile_progress (
+        id SMALLINT PRIMARY KEY CHECK (id = 1),
+        xp INT NOT NULL DEFAULT 0,
+        level TEXT NOT NULL DEFAULT 'Fledgling',
+        streak_days INT NOT NULL DEFAULT 0,
+        last_activity_date DATE,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS xp_events (
+        id BIGSERIAL PRIMARY KEY,
+        source TEXT NOT NULL,
+        points INT NOT NULL,
+        challenge_id BIGINT REFERENCES challenges(id) ON DELETE SET NULL,
+        lesson_id BIGINT REFERENCES lessons(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS badge_unlocks (
+        id BIGSERIAL PRIMARY KEY,
+        badge_key TEXT NOT NULL UNIQUE,
+        unlocked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    await this.pool.query(`
+      INSERT INTO profile_progress (id, xp, level, streak_days)
+      VALUES (1, 0, 'Fledgling', 0)
+      ON CONFLICT (id) DO NOTHING;
     `);
   }
 
@@ -196,14 +294,7 @@ export class DatabaseService {
     }
   }
 
-  async getDashboardStats(): Promise<{
-    xp: number;
-    documentCount: number;
-    masteryPercent: number;
-    streakDays: number;
-    level: string;
-    recentLesson: { id: number; title: string } | null;
-  }> {
+  async getDashboardStats(): Promise<DashboardStats> {
     const docs = await this.pool.query(`SELECT COUNT(*)::int AS count FROM documents`);
     const attempts = await this.pool.query(`
       SELECT
@@ -217,18 +308,31 @@ export class DatabaseService {
       ORDER BY created_at DESC
       LIMIT 1
     `);
+    const recentLessonsRes = await this.pool.query(`
+      SELECT id, title, created_at
+      FROM lessons
+      ORDER BY created_at DESC
+      LIMIT 5
+    `);
+    const progressRes = await this.pool.query(`
+      SELECT xp, level, streak_days
+      FROM profile_progress
+      WHERE id = 1
+      LIMIT 1
+    `);
 
     const totalAttempts = Number(attempts.rows[0]?.total ?? 0);
     const correctAttempts = Number(attempts.rows[0]?.correct ?? 0);
     const masteryPercent = totalAttempts > 0 ? Math.round((correctAttempts / totalAttempts) * 100) : 0;
-    const xp = correctAttempts * 100 + (totalAttempts - correctAttempts) * 10;
-    const level = xp >= 500 ? "Agent of the House" : xp >= 100 ? "Apprentice" : "Fledgling";
+    const xp = Number(progressRes.rows[0]?.xp ?? 0);
+    const level = String(progressRes.rows[0]?.level ?? levelFromXp(xp));
+    const streakDays = Number(progressRes.rows[0]?.streak_days ?? 0);
 
     return {
       xp,
       documentCount: Number(docs.rows[0]?.count ?? 0),
       masteryPercent,
-      streakDays: 0,
+      streakDays,
       level,
       recentLesson:
         recentLessonRes.rowCount && recentLessonRes.rowCount > 0
@@ -236,8 +340,44 @@ export class DatabaseService {
               id: Number(recentLessonRes.rows[0].id),
               title: recentLessonRes.rows[0].title
             }
-          : null
+          : null,
+      recentLessons: recentLessonsRes.rows.map((row) => ({
+        id: Number(row.id),
+        title: String(row.title),
+        createdAt: new Date(row.created_at).toISOString()
+      }))
     };
+  }
+
+  async getProgressStats(): Promise<ProgressStats> {
+    const dashboard = await this.getDashboardStats();
+    const badgesRes = await this.pool.query(`
+      SELECT badge_key
+      FROM badge_unlocks
+      ORDER BY unlocked_at ASC
+    `);
+    const badges =
+      badgesRes.rowCount && badgesRes.rowCount > 0
+        ? badgesRes.rows.map((row) => String(row.badge_key))
+        : badgeKeysFromXp(dashboard.xp);
+
+    return {
+      xp: dashboard.xp,
+      level: dashboard.level,
+      masteryPercent: dashboard.masteryPercent,
+      streakDays: dashboard.streakDays,
+      badges,
+      topics: [{ name: "Java Foundations", mastery: dashboard.masteryPercent }],
+      xpToNextLevel: xpToNextLevel(dashboard.xp)
+    };
+  }
+
+  async getStateSnapshot(): Promise<{
+    dashboard: DashboardStats;
+    progress: ProgressStats;
+  }> {
+    const [dashboard, progress] = await Promise.all([this.getDashboardStats(), this.getProgressStats()]);
+    return { dashboard, progress };
   }
 
   async getLessonById(lessonId: number): Promise<{
@@ -303,10 +443,131 @@ export class DatabaseService {
     };
   }
 
-  async saveAttempt(challengeId: number, isCorrect: boolean): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO attempts (challenge_id, is_correct) VALUES ($1, $2)`,
-      [challengeId, isCorrect]
-    );
+  async getLessons(input: {
+    page: number;
+    pageSize: number;
+  }): Promise<{
+    items: Array<{
+      id: number;
+      title: string;
+      language: "en" | "sr";
+      createdAt: string;
+      challengeCount: number;
+    }>;
+    total: number;
+  }> {
+    const offset = (input.page - 1) * input.pageSize;
+    const [itemsRes, countRes] = await Promise.all([
+      this.pool.query(
+        `
+          SELECT l.id, l.title, l.language, l.created_at, COUNT(c.id)::int AS challenge_count
+          FROM lessons l
+          LEFT JOIN challenges c ON c.lesson_id = l.id
+          GROUP BY l.id
+          ORDER BY l.created_at DESC
+          LIMIT $1 OFFSET $2
+        `,
+        [input.pageSize, offset]
+      ),
+      this.pool.query(`SELECT COUNT(*)::int AS total FROM lessons`)
+    ]);
+
+    return {
+      items: itemsRes.rows.map((row) => ({
+        id: Number(row.id),
+        title: String(row.title),
+        language: row.language,
+        createdAt: new Date(row.created_at).toISOString(),
+        challengeCount: Number(row.challenge_count ?? 0)
+      })),
+      total: Number(countRes.rows[0]?.total ?? 0)
+    };
+  }
+
+  async saveAttempt(
+    challengeId: number,
+    isCorrect: boolean
+  ): Promise<{ gainedXp: number; totalXp: number; level: string; streakDays: number }> {
+    const gainedXp = isCorrect ? 100 : 10;
+    const activityDate = dateOnlyUtc(new Date());
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`INSERT INTO attempts (challenge_id, is_correct) VALUES ($1, $2)`, [
+        challengeId,
+        isCorrect
+      ]);
+      const progressRes = await client.query(
+        `
+          SELECT xp, streak_days, last_activity_date
+          FROM profile_progress
+          WHERE id = 1
+          FOR UPDATE
+        `
+      );
+      const currentXp = Number(progressRes.rows[0]?.xp ?? 0);
+      const currentStreakDays = Number(progressRes.rows[0]?.streak_days ?? 0);
+      const lastActivityDate = progressRes.rows[0]?.last_activity_date
+        ? String(progressRes.rows[0].last_activity_date)
+        : null;
+
+      let nextStreakDays = currentStreakDays;
+      if (!lastActivityDate) {
+        nextStreakDays = 1;
+      } else {
+        const previousDay = new Date(`${lastActivityDate}T00:00:00.000Z`);
+        const nowDay = new Date(`${activityDate}T00:00:00.000Z`);
+        const diffDays = Math.round((nowDay.getTime() - previousDay.getTime()) / 86_400_000);
+        if (diffDays === 0) {
+          nextStreakDays = currentStreakDays;
+        } else if (diffDays === 1) {
+          nextStreakDays = Math.max(1, currentStreakDays + 1);
+        } else {
+          nextStreakDays = 1;
+        }
+      }
+
+      const totalXp = currentXp + gainedXp;
+      const level = levelFromXp(totalXp);
+      await client.query(
+        `
+          UPDATE profile_progress
+          SET xp = $1, level = $2, streak_days = $3, last_activity_date = $4, updated_at = NOW()
+          WHERE id = 1
+        `,
+        [totalXp, level, nextStreakDays, activityDate]
+      );
+
+      const challengeRes = await client.query(`SELECT lesson_id FROM challenges WHERE id = $1 LIMIT 1`, [
+        challengeId
+      ]);
+      const lessonId = challengeRes.rowCount ? Number(challengeRes.rows[0].lesson_id) : null;
+      await client.query(
+        `
+          INSERT INTO xp_events (source, points, challenge_id, lesson_id)
+          VALUES ($1, $2, $3, $4)
+        `,
+        [isCorrect ? "challenge.correct" : "challenge.incorrect", gainedXp, challengeId, lessonId]
+      );
+
+      for (const badgeKey of badgeKeysFromXp(totalXp)) {
+        await client.query(
+          `
+            INSERT INTO badge_unlocks (badge_key)
+            VALUES ($1)
+            ON CONFLICT (badge_key) DO NOTHING
+          `,
+          [badgeKey]
+        );
+      }
+
+      await client.query("COMMIT");
+      return { gainedXp, totalXp, level, streakDays: nextStreakDays };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 }

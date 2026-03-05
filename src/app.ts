@@ -60,6 +60,13 @@ export function createApp(aiProvider: AIProvider, db: DatabaseService) {
     res.json({ token: env.ACCESS_TOKEN });
   });
 
+  app.post("/api/logout", (req, res) => {
+    if (!ensureAuthorized(req, res)) {
+      return;
+    }
+    res.json({ ok: true });
+  });
+
   app.post("/api/upload", upload.single("pdf"), async (req, res, next) => {
     try {
       if (!ensureAuthorized(req, res)) {
@@ -176,6 +183,40 @@ export function createApp(aiProvider: AIProvider, db: DatabaseService) {
     }
   });
 
+  app.get("/api/state", async (req, res, next) => {
+    try {
+      if (!ensureAuthorized(req, res)) {
+        return;
+      }
+      const state = await db.getStateSnapshot();
+      res.json({
+        authenticated: true,
+        ...state
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/lessons", async (req, res, next) => {
+    try {
+      if (!ensureAuthorized(req, res)) {
+        return;
+      }
+      const page = Math.max(1, Number(req.query.page ?? 1));
+      const pageSize = Math.min(50, Math.max(1, Number(req.query.pageSize ?? 20)));
+      const lessons = await db.getLessons({ page, pageSize });
+      res.json({
+        items: lessons.items,
+        total: lessons.total,
+        page,
+        pageSize
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.get("/api/lessons/:lessonId", async (req, res, next) => {
     try {
       if (!ensureAuthorized(req, res)) {
@@ -237,8 +278,8 @@ export function createApp(aiProvider: AIProvider, db: DatabaseService) {
       }
       const challengeId = Number(req.params.challengeId);
       const isCorrect = Boolean((req.body as { isCorrect?: boolean }).isCorrect);
-      await db.saveAttempt(challengeId, isCorrect);
-      res.json({ ok: true });
+      const result = await db.saveAttempt(challengeId, isCorrect);
+      res.json({ ok: true, ...result });
     } catch (error) {
       next(error);
     }
@@ -249,22 +290,8 @@ export function createApp(aiProvider: AIProvider, db: DatabaseService) {
       if (!ensureAuthorized(req, res)) {
         return;
       }
-      const stats = await db.getDashboardStats();
-      res.json({
-        xp: stats.xp,
-        level: stats.level,
-        masteryPercent: stats.masteryPercent,
-        streakDays: stats.streakDays,
-        badges:
-          stats.xp >= 500
-            ? ["Agent of the House", "Flawless Contract"]
-            : stats.xp >= 100
-              ? ["Apprentice"]
-              : ["Fledgling"],
-        topics: [
-          { name: "Java Strings", mastery: stats.masteryPercent }
-        ]
-      });
+      const stats = await db.getProgressStats();
+      res.json(stats);
     } catch (error) {
       next(error);
     }
