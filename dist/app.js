@@ -3,13 +3,14 @@ import express from "express";
 import rateLimit from "express-rate-limit";
 import multer from "multer";
 import { createHash } from "node:crypto";
-import { GenerateRequestSchema, LessonBundleSchema } from "@academy/shared";
+import { ChallengeAttemptRequestSchema, ChallengeAttemptResponseSchema, ChallengeSchema, GenerateRequestSchema, LessonBundleSchema } from "@academy/shared";
 import { env } from "./config";
 import { errorMiddleware } from "./error.middleware";
 import { logError, logInfo } from "./logger";
 import { requestIdMiddleware } from "./request-id.middleware";
 import { extractPdfContent } from "./pdf/pdf-extractor";
 import { validateChallengeQuality } from "./ai/quality";
+import { LocalJavaEvaluator } from "./evaluator/java-evaluator";
 const upload = multer({
     limits: {
         fileSize: 20 * 1024 * 1024
@@ -27,8 +28,9 @@ function ensureAuthorized(req, res) {
     }
     return true;
 }
-export function createApp(aiProvider, db) {
+export function createApp(aiProvider, db, options = {}) {
     const app = express();
+    const javaEvaluator = options.javaEvaluator ?? new LocalJavaEvaluator();
     app.use(express.json({ limit: "2mb" }));
     app.use(cors({ origin: env.CORS_ORIGIN }));
     app.use(rateLimit({
@@ -215,12 +217,18 @@ export function createApp(aiProvider, db) {
                     insights: lessonData.lesson.insights,
                     language: lessonData.lesson.language
                 },
-                challenges: lessonData.challenges.map((challenge) => ({
-                    id: challenge.id,
-                    type: challenge.type,
-                    difficulty: challenge.difficulty,
-                    title: String(challenge.payload.question ?? "Challenge")
-                }))
+                challenges: lessonData.challenges.map((challenge) => {
+                    const parsed = ChallengeSchema.parse({
+                        ...challenge.payload,
+                        id: String(challenge.id),
+                        type: challenge.type
+                    });
+                    return {
+                        ...parsed,
+                        id: challenge.id,
+                        difficulty: challenge.difficulty
+                    };
+                })
             });
         }
         catch (error) {
@@ -255,9 +263,70 @@ export function createApp(aiProvider, db) {
                 return;
             }
             const challengeId = Number(req.params.challengeId);
-            const isCorrect = Boolean(req.body.isCorrect);
-            const result = await db.saveAttempt(challengeId, isCorrect);
-            res.json({ ok: true, ...result });
+            const submission = ChallengeAttemptRequestSchema.parse(req.body);
+            const challenge = await db.getChallengeById(challengeId);
+            if (!challenge) {
+                res.status(404).json({ message: "Challenge not found." });
+                return;
+            }
+            const parsedChallenge = ChallengeSchema.parse({
+                ...challenge.payload,
+                id: String(challenge.id),
+                type: challenge.type
+            });
+            if (submission.type !== parsedChallenge.type) {
+                res.status(400).json({ message: "Attempt type does not match challenge type." });
+                return;
+            }
+            const intent = submission.type === "coding" ? submission.intent : "submit";
+            let isCorrect = false;
+            let evaluation;
+            if (parsedChallenge.type === "mcq" && submission.type === "mcq") {
+                isCorrect = submission.selectedIndex === parsedChallenge.correctIndex;
+                evaluation = {
+                    type: "mcq",
+                    selectedIndex: submission.selectedIndex,
+                    correctIndex: parsedChallenge.correctIndex,
+                    explanation: parsedChallenge.explanation,
+                    whyWrongExplanations: parsedChallenge.whyWrongExplanations
+                };
+            }
+            else if (parsedChallenge.type === "coding" && submission.type === "coding") {
+                const codeResult = await javaEvaluator.evaluate({
+                    code: submission.code,
+                    testCases: parsedChallenge.testCases
+                });
+                isCorrect = codeResult.isCorrect;
+                evaluation = {
+                    type: "coding",
+                    code: submission.code,
+                    hint: parsedChallenge.hint,
+                    ahaInsight: parsedChallenge.ahaInsight,
+                    testResults: codeResult.testResults
+                };
+            }
+            else {
+                res.status(400).json({ message: "Unsupported challenge attempt payload." });
+                return;
+            }
+            const result = intent === "submit"
+                ? await db.saveAttempt(challengeId, isCorrect, {
+                    answerPayload: submission,
+                    evaluationPayload: evaluation
+                })
+                : await db.getProgressStats().then((stats) => ({
+                    gainedXp: 0,
+                    totalXp: stats.xp,
+                    level: stats.level,
+                    streakDays: stats.streakDays
+                }));
+            res.json(ChallengeAttemptResponseSchema.parse({
+                ok: true,
+                intent,
+                ...result,
+                isCorrect,
+                evaluation
+            }));
         }
         catch (error) {
             next(error);

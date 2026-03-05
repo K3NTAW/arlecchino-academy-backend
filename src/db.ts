@@ -128,8 +128,20 @@ export class DatabaseService {
         id BIGSERIAL PRIMARY KEY,
         challenge_id BIGINT NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,
         is_correct BOOLEAN NOT NULL,
+        answer_payload JSONB,
+        evaluation_payload JSONB,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+    `);
+
+    await this.pool.query(`
+      ALTER TABLE attempts
+      ADD COLUMN IF NOT EXISTS answer_payload JSONB;
+    `);
+
+    await this.pool.query(`
+      ALTER TABLE attempts
+      ADD COLUMN IF NOT EXISTS evaluation_payload JSONB;
     `);
 
     await this.pool.query(`
@@ -486,17 +498,29 @@ export class DatabaseService {
 
   async saveAttempt(
     challengeId: number,
-    isCorrect: boolean
+    isCorrect: boolean,
+    details?: {
+      answerPayload?: unknown;
+      evaluationPayload?: unknown;
+    }
   ): Promise<{ gainedXp: number; totalXp: number; level: string; streakDays: number }> {
     const gainedXp = isCorrect ? 100 : 10;
     const activityDate = dateOnlyUtc(new Date());
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      await client.query(`INSERT INTO attempts (challenge_id, is_correct) VALUES ($1, $2)`, [
-        challengeId,
-        isCorrect
-      ]);
+      await client.query(
+        `
+          INSERT INTO attempts (challenge_id, is_correct, answer_payload, evaluation_payload)
+          VALUES ($1, $2, $3::jsonb, $4::jsonb)
+        `,
+        [
+          challengeId,
+          isCorrect,
+          details?.answerPayload ? JSON.stringify(details.answerPayload) : null,
+          details?.evaluationPayload ? JSON.stringify(details.evaluationPayload) : null
+        ]
+      );
       const progressRes = await client.query(
         `
           SELECT xp, streak_days, last_activity_date

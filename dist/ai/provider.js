@@ -21,6 +21,54 @@ const InventoryItemSchema = z.object({
     priority: z.number().int().min(1).max(5).default(3)
 });
 const InventorySchema = z.array(InventoryItemSchema).min(1);
+function normalizeInventoryType(rawType, label) {
+    const normalized = String(rawType ?? "")
+        .trim()
+        .toLowerCase()
+        .replace(/[\s-]+/g, "_");
+    const aliasMap = {
+        concept: "concept",
+        term: "concept",
+        terminology: "concept",
+        method: "method",
+        function: "method",
+        api: "method",
+        comparison: "comparison",
+        compare: "comparison",
+        example: "example",
+        code_example: "example",
+        snippet: "example",
+        edge_case: "edge_case",
+        edgecase: "edge_case",
+        corner_case: "edge_case",
+        trap: "trap",
+        pitfall: "trap",
+        gotcha: "trap"
+    };
+    if (normalized in aliasMap) {
+        return aliasMap[normalized];
+    }
+    const labelHint = label.toLowerCase();
+    if (labelHint.includes(" vs ") || labelHint.includes("difference")) {
+        return "comparison";
+    }
+    if (labelHint.includes("null") || labelHint.includes("edge") || labelHint.includes("case")) {
+        return "edge_case";
+    }
+    return "concept";
+}
+function normalizeInventoryItem(value, index) {
+    const source = typeof value === "object" && value !== null ? value : {};
+    const label = String(source.label ?? source.term ?? source.name ?? `item-${index + 1}`).trim();
+    const evidence = String(source.evidence ?? source.reason ?? source.note ?? label).trim();
+    return {
+        id: String(source.id ?? `item-${index + 1}`),
+        type: normalizeInventoryType(source.type, label),
+        label: label || `item-${index + 1}`,
+        evidence: evidence || label || "No evidence provided.",
+        priority: Number.isFinite(Number(source.priority)) ? Number(source.priority) : 3
+    };
+}
 function extractMethodCandidates(sourceText) {
     const matches = sourceText.match(/[A-Za-z_][A-Za-z0-9_]*\s*\(/g) ?? [];
     const cleaned = matches
@@ -47,10 +95,10 @@ function extractComparisonCandidates(sourceText) {
 }
 function parseInventory(jsonLike) {
     if (Array.isArray(jsonLike)) {
-        return InventorySchema.parse(jsonLike);
+        return InventorySchema.parse(jsonLike.map(normalizeInventoryItem));
     }
     if (typeof jsonLike === "object" && jsonLike !== null && Array.isArray(jsonLike.items)) {
-        return InventorySchema.parse(jsonLike.items);
+        return InventorySchema.parse(jsonLike.items.map(normalizeInventoryItem));
     }
     throw new Error("Inventory extraction did not return a valid array.");
 }
@@ -200,14 +248,73 @@ export function normalizeLessonBundleShape(input) {
     }
     return normalized;
 }
+function tryParseJson(candidate) {
+    try {
+        return JSON.parse(candidate);
+    }
+    catch {
+        return null;
+    }
+}
+function extractFirstBalancedJsonChunk(text) {
+    const startIndex = [...text].findIndex((char) => char === "{" || char === "[");
+    if (startIndex < 0) {
+        return null;
+    }
+    const opening = text[startIndex];
+    const closing = opening === "{" ? "}" : "]";
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = startIndex; i < text.length; i += 1) {
+        const char = text[i];
+        if (inString) {
+            if (escaped) {
+                escaped = false;
+            }
+            else if (char === "\\") {
+                escaped = true;
+            }
+            else if (char === "\"") {
+                inString = false;
+            }
+            continue;
+        }
+        if (char === "\"") {
+            inString = true;
+            continue;
+        }
+        if (char === opening) {
+            depth += 1;
+        }
+        else if (char === closing) {
+            depth -= 1;
+            if (depth === 0) {
+                return text.slice(startIndex, i + 1);
+            }
+        }
+    }
+    return null;
+}
 function extractJsonFromText(text) {
     const trimmed = text.trim();
-    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-        return JSON.parse(trimmed);
+    const direct = tryParseJson(trimmed);
+    if (direct !== null) {
+        return direct;
     }
     const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
     if (fenced?.[1]) {
-        return JSON.parse(fenced[1].trim());
+        const fencedParsed = tryParseJson(fenced[1].trim());
+        if (fencedParsed !== null) {
+            return fencedParsed;
+        }
+    }
+    const balancedChunk = extractFirstBalancedJsonChunk(trimmed);
+    if (balancedChunk) {
+        const balancedParsed = tryParseJson(balancedChunk);
+        if (balancedParsed !== null) {
+            return balancedParsed;
+        }
     }
     throw new Error("AI response did not contain valid JSON.");
 }

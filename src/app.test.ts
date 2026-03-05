@@ -5,6 +5,7 @@ import { createApp } from "./app";
 import type { AIProvider } from "./ai/provider";
 import { env } from "./config";
 import type { DatabaseService } from "./db";
+import type { JavaEvaluator } from "./evaluator/java-evaluator";
 
 const testProvider: AIProvider = {
   async generateLessonBundle() {
@@ -117,15 +118,57 @@ const fakeDb = {
       xpToNextLevel: 100
     };
   },
-  async getChallengeById() {
-    return null;
+  async getChallengeById(challengeId: number) {
+    if (challengeId === 11) {
+      return {
+        id: 11,
+        lessonId: 1,
+        type: "coding",
+        difficulty: "medium",
+        payload: {
+          id: "coding-1",
+          type: "coding",
+          question: "Read two integers and print their sum.",
+          starterCode: "public class Main { public static void main(String[] args) {} }",
+          solution:
+            "import java.util.*; public class Main { public static void main(String[] args){ Scanner sc = new Scanner(System.in); int a=sc.nextInt(); int b=sc.nextInt(); System.out.print(a+b); } }",
+          hint: "Use Scanner and print the sum.",
+          ahaInsight: "The program is validated using stdin/stdout test cases.",
+          testCases: [{ input: "2 2", expected: "4" }]
+        }
+      };
+    }
+    return {
+      id: 10,
+      lessonId: 1,
+      type: "mcq",
+      difficulty: "medium",
+      payload: {
+        id: "mcq-1",
+        type: "mcq",
+        question: "Which one is immutable?",
+        options: ["String", "StringBuilder", "StringBuffer", "char[]"],
+        correctIndex: 0,
+        explanation: "String is immutable by design.",
+        whyWrongExplanations: ["StringBuilder is mutable.", "StringBuffer is mutable.", "char[] is mutable."]
+      }
+    };
   },
   async saveAttempt() {
     return { gainedXp: 10, totalXp: 10, level: "Fledgling", streakDays: 1 };
   }
 } as unknown as DatabaseService;
 
-const app = createApp(testProvider, fakeDb);
+const fakeJavaEvaluator: JavaEvaluator = {
+  async evaluate() {
+    return {
+      isCorrect: true,
+      testResults: [{ input: "2 2", expected: "4", actual: "4", passed: true }]
+    };
+  }
+};
+
+const app = createApp(testProvider, fakeDb, { javaEvaluator: fakeJavaEvaluator });
 
 describe("backend app", () => {
   it("returns health state", async () => {
@@ -155,5 +198,47 @@ describe("backend app", () => {
       .attach("pdf", Buffer.from("fake"), "sample.pdf");
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty("usedOcrFallback");
+  });
+
+  it("returns lesson details with full interactive challenges", async () => {
+    const res = await request(app).get("/api/lessons/1").set("Authorization", `Bearer ${env.ACCESS_TOKEN}`);
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.challenges)).toBe(true);
+    expect(res.body.challenges[0]).toHaveProperty("question");
+    expect(res.body.challenges[0]).toHaveProperty("options");
+  });
+
+  it("evaluates and records MCQ attempts through typed contract", async () => {
+    const res = await request(app)
+      .post("/api/challenges/10/attempt")
+      .set("Authorization", `Bearer ${env.ACCESS_TOKEN}`)
+      .send({
+        type: "mcq",
+        selectedIndex: 0
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.isCorrect).toBe(true);
+    expect(res.body.evaluation.type).toBe("mcq");
+    expect(res.body.evaluation.correctIndex).toBe(0);
+  });
+
+  it("runs coding checks without awarding XP on check intent", async () => {
+    const res = await request(app)
+      .post("/api/challenges/11/attempt")
+      .set("Authorization", `Bearer ${env.ACCESS_TOKEN}`)
+      .send({
+        type: "coding",
+        code: "public class Main { public static void main(String[] args){ System.out.print(4); } }",
+        intent: "check"
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.intent).toBe("check");
+    expect(res.body.gainedXp).toBe(0);
+    expect(res.body.evaluation.type).toBe("coding");
+    expect(Array.isArray(res.body.evaluation.testResults)).toBe(true);
   });
 });
